@@ -14,6 +14,8 @@ env:
 jobs:
   # Gate. Every later job depends on this one, so a failing test means the
   # build and deploy jobs never start and the running version stays up.
+  # This job runs on every push, pull request, and manual run; the jobs after
+  # it are manual-only (see their `if:` conditions).
   test:
     name: Tests (SQLite + PostgreSQL)
     runs-on: ubuntu-latest
@@ -72,6 +74,11 @@ jobs:
     name: Build image
     runs-on: ubuntu-latest
     needs: test
+    # Only on a manual run. The deploy below targets a kind cluster on a
+    # developer machine, which a GitHub-hosted runner cannot reach, so there
+    # is nothing for a pushed build to hand off to. Pushes and pull requests
+    # run the tests and stop there.
+    if: github.event_name == 'workflow_dispatch'
     outputs:
       image_tag: ${{ steps.tag.outputs.image_tag }}
     steps:
@@ -104,6 +111,10 @@ jobs:
     name: Deploy to kind
     runs-on: ubuntu-latest
     needs: [test, build]
+    # Manual only, for the same reason as build. needs: already keeps this
+    # from running when the tests fail; the condition additionally keeps it
+    # from running where the cluster does not exist.
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
