@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+  namespace: agent-relay
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-relay
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay
+  namespace: agent-relay
+spec:
+  # Two replicas prove the delivery guarantee holds across processes: both
+  # serve claims, and FOR UPDATE SKIP LOCKED keeps one lease per task.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agent-relay
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: agent-relay
+    spec:
+      # The app creates its schema at startup and 503s on /ready until the
+      # database answers, so a crash-loop here means Postgres is not up yet.
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -p 5432 -U relay -d relay; do echo "waiting for postgres"; sleep 2; done
+      containers:
+        - name: api
+          image: agent-relay:local
+          # kind loads the image onto the node; never go to a registry for it.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: RELAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: RELAY_DATABASE_URL
+          # /ready queries the real tables, so a pod only receives traffic
+          # once its schema is actually usable.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness uses /health: restarting a pod cannot fix a database
+          # outage, and restarting every replica during one would make it worse.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
