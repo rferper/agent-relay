@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Published so the test suite can run from the host against this same
+    # database. 5432 and 55432 are taken by other local projects.
+    ports:
+      - "55433:5432"
+    healthcheck:
+      # Without -U the check runs as the image's default OS user and can pass
+      # or fail for the wrong reason; name the role the API will connect as.
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build: .
+    environment:
+      # "postgres" is the compose service name, which doubles as its hostname
+      # on the default network. localhost would be the API container itself.
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@postgres:5432/relay
+    depends_on:
+      postgres:
+        # The app creates its schema at import, so it must not start before
+        # the database can accept connections.
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

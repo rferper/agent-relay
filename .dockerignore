@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.db
+*.db-shm
+*.db-wal
+*-credentials.json
+Dockerfile
+.dockerignore
