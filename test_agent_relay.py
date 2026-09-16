@@ -9,17 +9,23 @@ not from a Python lock.
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 # Default to a scratch DB so `pytest` never resets the dev server's
 # `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
 # (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# Resolve the temp directory at runtime: SQLite will not create a missing
+# parent directory, and a hardcoded POSIX path fails on Windows.
+_SCRATCH_DB = Path(tempfile.gettempdir(), "agent-relay-test.db")
+os.environ.setdefault("RELAY_DATABASE_URL", f"sqlite:///{_SCRATCH_DB.as_posix()}")
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 import main
 from database import Attempt, Base, Task, as_db_time, db_session, engine, utcnow
@@ -160,3 +166,83 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
         missing_name = client.post("/api/v1/agents", json={})
         assert missing_name.status_code == 400
         assert missing_name.json()["error"]["code"] == "invalid_input"
+
+
+def test_spec_scenario_1_agents_exchange_task_and_sender_reads_result():
+    """SPEC.md acceptance scenario 1, asserted from the sender's view at each stage.
+
+    The status the sender observes is the contract the dashboard renders, so
+    this walks queued -> processing -> completed rather than only checking the
+    terminal state.
+    """
+
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "alice-reviewer")
+        recipient, recipient_headers = register(client, "bob-worker")
+        assert sender["agent_id"] != recipient["agent_id"]
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "review this python function"},
+        )
+        assert sent.status_code == 201
+        task_id = sent.json()["task_id"]
+        assert sent.json()["status"] == "queued"
+
+        queued = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()
+        assert queued["status"] == "queued"
+        assert queued["output"] is None and queued["error"] is None
+        assert queued["finished_at"] is None
+        assert queued["attempt_count"] == 0
+
+        claim = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "bob-laptop-1", "wait_seconds": 0},
+        )
+        assert claim.status_code == 200
+        claimed = claim.json()
+        assert claimed["task_id"] == task_id
+        assert claimed["from"] == sender["agent_id"]
+        assert claimed["attempt"] == 1
+
+        processing = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()
+        assert processing["status"] == "processing"
+        assert processing["output"] is None
+        assert processing["attempt_count"] == 1
+
+        output = claimed["input"].upper()
+        complete = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={"claim_token": claimed["claim_token"], "output": output},
+        )
+        assert complete.status_code == 200
+        assert complete.json() == {"task_id": task_id, "status": "completed"}
+
+        # The sender reads the result: scenario 1's final step.
+        result = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()
+        assert result["status"] == "completed"
+        assert result["output"] == "REVIEW THIS PYTHON FUNCTION"
+        assert result["error"] is None
+        assert result["finished_at"] is not None
+        assert result["attempt_count"] == 1
+
+        # The dashboard reads these same endpoints, so assert what it renders.
+        listed = client.get("/api/v1/tasks?direction=sent", headers=sender_headers).json()
+        assert [(t["task_id"], t["status"]) for t in listed["items"]] == [(task_id, "completed")]
+        history = client.get(f"/api/v1/tasks/{task_id}/attempts", headers=sender_headers).json()
+        assert [(a["attempt"], a["outcome"], a["worker_id"]) for a in history["items"]] == [
+            (1, "completed", "bob-laptop-1")
+        ]
+
+        # Assert the durable rows too, not only the HTTP projection of them.
+        with db_session() as db:
+            stored = db.get(Task, task_id)
+            assert (stored.status, stored.output, stored.error) == ("completed", output, None)
+            assert stored.sender_id == sender["agent_id"]
+            assert stored.recipient_id == recipient["agent_id"]
+            attempt = db.scalars(select(Attempt).where(Attempt.task_id == task_id)).one()
+            assert attempt.outcome == "completed"
+            assert attempt.claim_token_hash != claimed["claim_token"]
