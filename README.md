@@ -1,29 +1,43 @@
-# Agent Relay (SQLite starter)
+# Agent Relay (PostgreSQL)
 
 Agent Relay is a small FastAPI service for registering agents, delivering one
-task at a time, and recording results. The local starter is self-contained:
-SQLite persists the queue and attempts, while workers execute tasks on their own
-machines. The included worker deterministically returns `input.upper()`.
+task at a time, and recording results. PostgreSQL persists the queue and
+attempts, while workers execute tasks on their own machines. The included
+worker deterministically returns `input.upper()`.
 
 ## Run it
 
 ```bash
-uv sync
-uv run uvicorn main:app --reload
+docker compose up --build
 ```
 
-Open <http://127.0.0.1:8000/> for the token-based local dashboard. The default
-database is `./agent-relay.db`; set `RELAY_DATABASE_URL` to use another SQLite
-file. `GET /health` is a liveness check and `GET /ready` verifies database
+Compose starts two services: `postgres` and the API. Open
+<http://127.0.0.1:8001/> for the token-based dashboard. Inside the Compose
+network the API reaches the database at the service hostname `postgres`, which
+is what `RELAY_DATABASE_URL` in `compose.yaml` points at.
+
+To run the API directly against a database you already have:
+
+```bash
+uv sync
+RELAY_DATABASE_URL=postgresql+psycopg://relay:relay@127.0.0.1:55433/relay \
+  uv run uvicorn main:app --reload
+```
+
+SQLite still works if you set `RELAY_DATABASE_URL=sqlite:///./agent-relay.db`,
+which is how the test suite runs without a database server. It is a
+development convenience, not the supported deployment.
+
+`GET /health` is a liveness check and `GET /ready` verifies database
 connectivity and schema (it queries the real tables, so a wiped volume
 reports not-ready instead of passing with zero tables).
 
 Register two identities and send a task:
 
 ```bash
-alice=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
+alice=$(curl -sS -X POST http://127.0.0.1:8001/api/v1/agents \
   -H 'content-type: application/json' -d '{"name":"alice"}')
-bob=$(curl -sS -X POST http://127.0.0.1:8000/api/v1/agents \
+bob=$(curl -sS -X POST http://127.0.0.1:8001/api/v1/agents \
   -H 'content-type: application/json' -d '{"name":"uppercase"}')
 ```
 
@@ -39,7 +53,7 @@ The worker can register itself and save credentials in a mode-0600 JSON file:
 
 ```bash
 uv run python main.py worker \
-  --base-url http://127.0.0.1:8000 \
+  --base-url http://127.0.0.1:8001 \
   --name uppercase \
   --credentials ./uppercase-credentials.json \
   --worker-id laptop-1
@@ -67,13 +81,17 @@ uv run python main.py worker --agent-id agent_123 --token agt_… --worker-id la
 
 ## Storage and delivery behavior
 
-`database.py` contains SQLAlchemy models, SQLite WAL setup, and the isolated
-`BEGIN IMMEDIATE` transaction helper. `storage.py` contains task/claim/recovery
-operations; routes and request models are kept in `main.py` and `schemas.py`.
-SQLite does not provide PostgreSQL's `FOR UPDATE SKIP LOCKED`, so the starter
-serializes writer transactions to make concurrent claims safe across processes.
-Students can port this storage seam to PostgreSQL later without changing the
-HTTP protocol or lifecycle in `SPEC.md`.
+`database.py` contains SQLAlchemy models, engine setup, and the
+`writer_transaction` helper that every claim, heartbeat, terminal submission,
+and recovery pass opens. `storage.py` contains those operations; routes and
+request models are kept in `main.py` and `schemas.py`.
+
+Concurrency is where the two backends differ. On PostgreSQL a claim selects its
+task with `FOR UPDATE SKIP LOCKED`, so simultaneous workers lock different rows
+and none of them waits. SQLite has no such clause, so its transactions open with
+`BEGIN IMMEDIATE` and serialize writers instead. Both satisfy the same rule —
+one active lease per task — and the HTTP protocol and lifecycle in `SPEC.md` are
+identical either way.
 
 Claims are at-least-once and leased for 60 seconds by default. Heartbeats extend
 an active lease. A completion or failure must include the recipient's bearer
@@ -91,8 +109,9 @@ asset serving:
 uv run pytest -q
 ```
 
-Tests default to a scratch database at `/tmp/agent-relay-test.db` so they
-don't reset your dev server's `./agent-relay.db`. The fixture drops and
+Tests default to a scratch database named `agent-relay-test.db` in the
+platform temp directory (`/tmp` on Linux and macOS, `%TEMP%` on Windows) so
+they don't reset your dev server's `./agent-relay.db`. The fixture drops and
 recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
 the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
 running tests against another database.
