@@ -1,9 +1,14 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+PostgreSQL is the default backend; SQLite remains supported so the suite can
+run without a database server.  This module is the only place that knows which
+dialect is in use: it owns the engine, the connection pragmas, and the writer
+transaction that :mod:`storage` opens before claiming or finishing work.
+
+The two dialects reach the same guarantee by different means.  PostgreSQL
+selects claimable rows with ``FOR UPDATE SKIP LOCKED`` inside an ordinary
+transaction, so concurrent workers skip locked rows instead of blocking.
+SQLite has no such clause, so it serializes writers with ``BEGIN IMMEDIATE``.
 """
 
 from __future__ import annotations
@@ -18,8 +23,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
+# Matches the service name and credentials in compose.yaml: inside the Compose
+# network the API reaches the database at the service hostname ``postgres``.
+DEFAULT_DATABASE_URL = "postgresql+psycopg://relay:relay@postgres:5432/relay"
+
+
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
 
 
 def positive_int(name: str, default: int) -> int:
@@ -31,6 +41,8 @@ def positive_int(name: str, default: int) -> int:
 
 
 DATABASE_URL = _database_url()
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
+IS_POSTGRES = not IS_SQLITE
 LEASE_SECONDS = positive_int("RELAY_LEASE_SECONDS", 60)
 MAX_ATTEMPTS = positive_int("RELAY_MAX_ATTEMPTS", 5)
 RECOVERY_INTERVAL_SECONDS = max(1, positive_int("RELAY_RECOVERY_INTERVAL_SECONDS", 5))
@@ -141,6 +153,10 @@ if _is_sqlite(DATABASE_URL):
         from sqlalchemy.pool import StaticPool
 
         engine_kwargs["poolclass"] = StaticPool
+else:
+    # Long-polling claims hold a connection for up to 30 seconds, so the pool
+    # needs room for more concurrent workers than the default five.
+    engine_kwargs.update({"pool_size": 10, "max_overflow": 20, "pool_recycle": 1800})
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
@@ -176,20 +192,24 @@ def db_session() -> Generator[Session, None, None]:
 
 
 @contextmanager
-def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+def writer_transaction() -> Generator[Session, None, None]:
+    """Open one transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    On PostgreSQL this is an ordinary transaction: exclusivity comes from the
+    ``FOR UPDATE SKIP LOCKED`` row locks that :mod:`storage` takes inside it,
+    so two workers claiming at once lock different rows and neither waits.
+
+    On SQLite there is no such clause, so the transaction opens with
+    ``BEGIN IMMEDIATE`` to reserve the single writer slot up front.  That
+    serializes claims across processes at the cost of concurrency, which is
+    why PostgreSQL is the default.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if IS_SQLITE:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
         connection.commit()
@@ -201,17 +221,24 @@ def immediate_transaction() -> Generator[Session, None, None]:
         connection.close()
 
 
+# The pre-PostgreSQL name for the same seam.
+immediate_transaction = writer_transaction
+
+
 def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
+    expired_query = (
+        select(Attempt)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if IS_POSTGRES:
+        # Several API replicas run this loop. Skipping locked rows lets one
+        # replica recover an attempt while another moves on to the next.
+        expired_query = expired_query.with_for_update(skip_locked=True)
+    expired = list(db.scalars(expired_query))
     count = 0
     for attempt in expired:
         task = db.get(Task, attempt.task_id)
@@ -254,6 +281,8 @@ __all__ = [
     "as_db_time",
     "db_session",
     "db_time",
+    "IS_POSTGRES",
+    "IS_SQLITE",
     "engine",
     "immediate_transaction",
     "init_db",
@@ -261,4 +290,5 @@ __all__ = [
     "recover_expired",
     "recover_expired_in_session",
     "utcnow",
+    "writer_transaction",
 ]

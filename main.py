@@ -118,7 +118,14 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Agent Relay", version="0.1.0", lifespan=lifespan)
 # ASGI transports used by small scripts do not always run lifespan handlers;
 # initialize the schema at import as well as during normal application startup.
-init_db()
+# This is best effort: ``python main.py worker`` imports this module to reach
+# the CLI, and a worker runs on its own machine with no route to the database.
+# Startup still calls init_db() through the lifespan handler, so a genuinely
+# unreachable database fails loudly when the server boots rather than here.
+try:
+    init_db()
+except Exception:  # pragma: no cover - exercised by the DB-less worker CLI
+    LOGGER.debug("deferred schema initialization to application startup", exc_info=True)
 
 
 @app.exception_handler(RelayError)
