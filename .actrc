@@ -1,0 +1,7 @@
+# act runs the workflow locally. These flags give the runner what the job needs.
+# The Docker daemon socket lets the build job build images and lets the deploy
+# job drive kind. The cluster is reached over the host-published API port (see
+# the mounted kubeconfig), NOT by joining the kind network: joining it would
+# detach the job from act's own service network and break the postgres service.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+--container-daemon-socket /var/run/docker.sock

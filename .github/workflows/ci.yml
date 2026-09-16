@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: agent-relay
+  KIND_CLUSTER: agent-relay
+  K8S_NAMESPACE: agent-relay
+
+jobs:
+  # Gate. Every later job depends on this one, so a failing test means the
+  # build and deploy jobs never start and the running version stays up.
+  test:
+    name: Tests (SQLite + PostgreSQL)
+    runs-on: ubuntu-latest
+
+    # Running the job in a container puts it on the same network as the
+    # service containers, which is what makes the `postgres` hostname below
+    # resolve. Without this the job runs on the host and the service is only
+    # reachable through a published port.
+    container:
+      image: catthehacker/ubuntu:act-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay_test
+        # Deliberately not published to the host: the job container reaches
+        # the service by its name on the job network, and publishing 5432
+        # would collide with any PostgreSQL already running on the machine.
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # --frozen matches the Dockerfile: install exactly what uv.lock pins.
+        run: uv sync --frozen
+
+      - name: Run the suite against SQLite
+        # The starter's own default backend, and it needs no database server.
+        run: uv run pytest -q
+        env:
+          RELAY_DATABASE_URL: sqlite:///./ci-agent-relay.db
+
+      - name: Run the suite against PostgreSQL
+        # Same tests, real database: this is the path production runs on, and
+        # the only one that exercises FOR UPDATE SKIP LOCKED.
+        # The host is the service name, which resolves because this job
+        # declares a `container:` above.
+        run: uv run pytest -q
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@postgres:5432/relay_test
+
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute a unique tag
+        id: tag
+        # The commit SHA plus run number: never reused, and traceable back to
+        # the exact source. A floating tag like :latest would leave Kubernetes
+        # unable to tell two versions apart, so the rollout would be a no-op.
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo local)"
+          # The content digest is what actually guarantees uniqueness here.
+          # On GitHub the run number increments per run, but a local act run
+          # always reports run 1 and builds from an uncommitted tree, so the
+          # SHA and run number alone would repeat a tag across versions and
+          # Kubernetes would treat the "new" image as the one already running.
+          CONTENT="$(cat *.py dashboard.html | sha256sum | cut -c1-8)"
+          echo "image_tag=${SHORT_SHA}-${GITHUB_RUN_NUMBER}-${CONTENT}" >> "$GITHUB_OUTPUT"
+          echo "tag: ${SHORT_SHA}-${GITHUB_RUN_NUMBER}-${CONTENT}"
+
+      - name: Build
+        run: |
+          docker build -t "${IMAGE_NAME}:${{ steps.tag.outputs.image_tag }}" .
+          docker image inspect "${IMAGE_NAME}:${{ steps.tag.outputs.image_tag }}" \
+            --format 'built {{.RepoTags}} ({{.Size}} bytes)'
+
+  deploy:
+    name: Deploy to kind
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure kubectl and kind are available
+        # The GitHub-hosted runner ships kubectl but not kind; act's runner
+        # image may ship neither. Install only what is missing so this step is
+        # a no-op on a runner that already has them.
+        run: |
+          set -euo pipefail
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KV="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+            curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KV}/bin/linux/amd64/kubectl"
+            chmod +x /usr/local/bin/kubectl
+          fi
+          if ! command -v kind >/dev/null 2>&1; then
+            curl -fsSLo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+            chmod +x /usr/local/bin/kind
+          fi
+          kubectl version --client
+          kind version
+
+      - name: Check the cluster is reachable
+        # KUBECONFIG comes from the runner environment. Failing here rather
+        # than mid-rollout makes a credentials problem obvious.
+        run: kubectl cluster-info
+
+      - name: Load the image into kind
+        # kind nodes have their own image store, so an image built on the host
+        # is invisible to the cluster until it is loaded onto the node.
+        run: |
+          kind load docker-image \
+            "${IMAGE_NAME}:${{ needs.build.outputs.image_tag }}" \
+            --name "${KIND_CLUSTER}"
+
+      - name: Roll out the new tag
+        run: |
+          kubectl -n "${K8S_NAMESPACE}" set image deployment/agent-relay \
+            "api=${IMAGE_NAME}:${{ needs.build.outputs.image_tag }}"
+          kubectl -n "${K8S_NAMESPACE}" annotate deployment/agent-relay \
+            kubernetes.io/change-cause="ci: ${IMAGE_NAME}:${{ needs.build.outputs.image_tag }}" \
+            --overwrite
+
+      - name: Wait for the rollout to finish
+        # Fail the job if the new pods never become ready. maxUnavailable: 0
+        # means the old pods keep serving until the new ones pass /ready.
+        run: |
+          kubectl -n "${K8S_NAMESPACE}" rollout status deployment/agent-relay --timeout=180s
+
+      - name: Report what is running
+        run: |
+          kubectl -n "${K8S_NAMESPACE}" get pods -l app=agent-relay \
+            -o custom-columns='POD:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[*].ready'
